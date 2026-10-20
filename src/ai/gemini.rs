@@ -66,6 +66,8 @@ pub enum Part {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct FunctionCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub name: String,
     pub args: Value,
 }
@@ -73,6 +75,8 @@ pub struct FunctionCall {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct FunctionResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub name: String,
     pub response: Value,
 }
@@ -935,6 +939,8 @@ pub(crate) fn translate_ai_request_with_options(
 ) -> Result<GenerateContentRequest> {
     let mut contents: Vec<Content> = Vec::new();
     let mut system_instruction = None;
+    let mut call_id_to_name: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     if let Some(sys_content) = request.system {
         system_instruction = Some(Content {
@@ -999,8 +1005,15 @@ pub(crate) fn translate_ai_request_with_options(
                 }
                 if let Some(tool_calls) = msg.tool_calls {
                     for call in tool_calls {
+                        let call_id = if !call.id.is_empty() && call.id != call.function_name {
+                            call_id_to_name.insert(call.id.clone(), call.function_name.clone());
+                            Some(call.id)
+                        } else {
+                            None
+                        };
                         parts.push(Part::FunctionCall {
                             function_call: FunctionCall {
+                                id: call_id,
                                 name: call.function_name,
                                 args: call.arguments,
                             },
@@ -1022,11 +1035,18 @@ pub(crate) fn translate_ai_request_with_options(
                 // Gemini expects a 'user' role for FunctionResponse parts.
                 // Consecutive tool responses and user messages must be merged into a single
                 // turn to preserve strict user/model turn alternation.
+                let raw_id = msg
+                    .tool_call_id
+                    .context("Tool message missing tool_call_id")?;
+                let (resp_id, resp_name) = if let Some(fn_name) = call_id_to_name.get(&raw_id) {
+                    (Some(raw_id), fn_name.clone())
+                } else {
+                    (None, raw_id)
+                };
                 let part = Part::FunctionResponse {
                     function_response: FunctionResponse {
-                        name: msg
-                            .tool_call_id
-                            .context("Tool message missing tool_call_id")?,
+                        id: resp_id,
+                        name: resp_name,
                         response: serde_json::from_str(
                             &msg.content.unwrap_or_else(|| "{}".to_string()),
                         )
@@ -1193,8 +1213,14 @@ pub(crate) fn translate_ai_response(resp: GenerateContentResponse) -> Result<AiR
                     .clone()
                     .filter(|s| !s.is_empty())
                     .or(pending_signature);
+                let call_id = function_call
+                    .id
+                    .as_ref()
+                    .filter(|s| !s.is_empty())
+                    .cloned()
+                    .unwrap_or_else(|| function_call.name.clone());
                 tool_calls.push(ToolCall {
-                    id: function_call.name.clone(), // Gemini doesn't have explicit call IDs in v1beta
+                    id: call_id,
                     function_name: function_call.name.clone(),
                     arguments: crate::toolbox::utils::normalize_json_numbers(
                         function_call.args.clone(),
@@ -1953,6 +1979,7 @@ mod tests {
                     role: "model".to_string(),
                     parts: vec![Part::FunctionCall {
                         function_call: FunctionCall {
+                            id: None,
                             name: "test_tool".to_string(),
                             args: json!({"arg1": "val1"}),
                         },
@@ -1982,6 +2009,87 @@ mod tests {
             tool_calls[0].thought_signature.as_deref(),
             Some("thought_sig_xyz")
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_translate_function_call_id() -> Result<()> {
+        let gemini_resp = GenerateContentResponse {
+            candidates: Some(vec![Candidate {
+                content: Content {
+                    role: "model".to_string(),
+                    parts: vec![Part::FunctionCall {
+                        function_call: FunctionCall {
+                            id: Some("call_1".to_string()),
+                            name: "git_diff".to_string(),
+                            args: json!({"commit": "HEAD"}),
+                        },
+                        thought_signature: None,
+                    }],
+                },
+                finish_reason: Some("STOP".to_string()),
+                continuation_token: None,
+            }]),
+            prompt_feedback: None,
+            usage_metadata: None,
+        };
+
+        let ai_resp = translate_ai_response(gemini_resp)?;
+        let tool_calls = ai_resp.tool_calls.as_ref().expect("Expected tool calls");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_1");
+        assert_eq!(tool_calls[0].function_name, "git_diff");
+
+        let follow_up = AiRequest {
+            system: None,
+            messages: vec![
+                AiMessage {
+                    role: AiRole::User,
+                    content: Some("Inspect HEAD".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                AiMessage {
+                    role: AiRole::Assistant,
+                    content: None,
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: Some(tool_calls.clone()),
+                    tool_call_id: None,
+                },
+                AiMessage {
+                    role: AiRole::Tool,
+                    content: Some(r#"{"diff":"ok"}"#.to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    tool_call_id: Some("call_1".to_string()),
+                },
+            ],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+            reasoning_effort: None,
+        };
+
+        let translated = translate_ai_request(follow_up)?;
+        assert_eq!(translated.contents.len(), 3);
+        if let Part::FunctionCall { function_call, .. } = &translated.contents[1].parts[0] {
+            assert_eq!(function_call.id.as_deref(), Some("call_1"));
+            assert_eq!(function_call.name, "git_diff");
+        } else {
+            panic!("Expected FunctionCall part");
+        }
+        if let Part::FunctionResponse { function_response } = &translated.contents[2].parts[0] {
+            assert_eq!(function_response.id.as_deref(), Some("call_1"));
+            assert_eq!(function_response.name, "git_diff");
+        } else {
+            panic!("Expected FunctionResponse part");
+        }
 
         Ok(())
     }
