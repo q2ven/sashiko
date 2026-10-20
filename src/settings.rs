@@ -1137,6 +1137,7 @@ pub struct Overrides {
     pub worktree_dir: Option<String>,
     pub no_ai: bool,
     pub ai_provider: Option<String>,
+    pub ai_model: Option<String>,
     pub effort: Option<EffortMode>,
     pub stages: Option<Vec<String>>,
     pub read_only: bool,
@@ -1165,6 +1166,9 @@ impl Settings {
         }
         if let Some(provider) = overrides.ai_provider {
             self.ai.provider = provider;
+        }
+        if let Some(model) = overrides.ai_model {
+            self.ai.model = model;
         }
         if let Some(effort) = overrides.effort {
             self.review.effort = Some(effort);
@@ -1567,6 +1571,7 @@ mod tests {
             worktree_dir: Some("from_flag".to_string()),
             no_ai: true,
             ai_provider: Some("stdio-claude".to_string()),
+            ai_model: Some("from_flag".to_string()),
             effort: Some(EffortMode::Dynamic),
             stages: Some(vec!["pre-screen".to_string()]),
             read_only: true,
@@ -1587,6 +1592,7 @@ mod tests {
         assert_eq!(settings.review.worktree_dir.as_deref(), Some("from_flag"));
         assert!(settings.ai.no_ai);
         assert_eq!(settings.ai.provider, "stdio-claude");
+        assert_eq!(settings.ai.model, "from_flag");
         assert_eq!(settings.review.effort, Some(EffortMode::Dynamic));
         assert_eq!(
             settings.review.stages.as_deref(),

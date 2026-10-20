@@ -148,6 +148,10 @@ enum Commands {
         #[arg(long)]
         ai_provider: Option<String>,
 
+        /// AI model override
+        #[arg(short = 'm', long = "model", visible_alias = "ai-model")]
+        model: Option<String>,
+
         /// Reasoning effort mode override (mid, high, or dynamic) for supported models
         #[arg(long)]
         effort: Option<EffortMode>,
@@ -215,6 +219,10 @@ enum Commands {
         /// AI provider override
         #[arg(long)]
         ai_provider: Option<String>,
+
+        /// AI model override
+        #[arg(short = 'm', long = "model", visible_alias = "ai-model")]
+        model: Option<String>,
 
         /// Reasoning effort mode override (mid, high, or dynamic) for supported models
         #[arg(long)]
@@ -330,12 +338,14 @@ fn cli_overrides(cli: &Cli) -> Overrides {
         Some(Commands::Review {
             no_ai,
             ai_provider,
+            model,
             effort,
             stages,
             ..
         }) => Overrides {
             no_ai: *no_ai,
             ai_provider: ai_provider.clone(),
+            ai_model: model.clone(),
             effort: effort.or(cli.effort),
             stages: stages.clone(),
             ..Default::default()
@@ -345,6 +355,7 @@ fn cli_overrides(cli: &Cli) -> Overrides {
             worktree_dir,
             no_ai,
             ai_provider,
+            model,
             effort,
             stages,
             ..
@@ -353,6 +364,7 @@ fn cli_overrides(cli: &Cli) -> Overrides {
             worktree_dir: worktree_dir.as_deref().map(path_string),
             no_ai: *no_ai,
             ai_provider: ai_provider.clone(),
+            ai_model: model.clone(),
             effort: effort.or(cli.effort),
             stages: stages.clone(),
             ..Default::default()
