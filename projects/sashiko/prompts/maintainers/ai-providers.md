@@ -23,15 +23,18 @@ symbols = [
 ## Provider Decorator Stack Policy
 
 - Maintain the decorator wrapping order from outermost to innermost:
-  `BackoffProvider` -> `ConcurrencyLimitedProvider` -> `LoggingProvider` ->
-  `CachingAiProvider` -> concrete provider.
+  `LoggingProvider` -> `CachingAiProvider` -> `BackoffProvider` ->
+  `ConcurrencyLimitedProvider` -> concrete provider.
+  - `CachingAiProvider` must remain outside `BackoffProvider` and
+    `ConcurrencyLimitedProvider` so cache hits return immediately without
+    waiting on rate-limit pacing or holding a concurrency semaphore permit.
   - `BackoffProvider` must remain outside `ConcurrencyLimitedProvider` so tasks
     sleeping on a rate-limit or transient backoff window never hold a
     concurrency semaphore permit.
-  - `CachingAiProvider` must remain innermost (wrapping the concrete provider
-    directly), or any outer decorator placed inside it must explicitly forward
-    `cache_identity` and `cache_stats` so model/effort/token knobs are never
-    dropped from the response-cache key.
+  - Any decorator placed inside `CachingAiProvider` (`BackoffProvider`,
+    `ConcurrencyLimitedProvider`, etc.) must explicitly forward
+    `cache_identity`, `cache_stats`, and `forget` so model/effort/token knobs
+    are never dropped from the response-cache key.
 - Any new provider-shaping configuration knob that alters model responses
   without appearing in `AiRequest` JSON (such as thinking budget, reasoning
   effort, or output token cap) must be included in `cache_identity`.

@@ -3057,16 +3057,6 @@ async fn run_review_tool_with_cmd_and_overrides(
     llm_semaphore: Arc<Semaphore>,
     worker_overrides: &WorkerSubprocessOverrides,
 ) -> Result<serde_json::Value> {
-    // Cap concurrent model calls with the shared limiter instead of taking the
-    // semaphore by hand around each call. This also releases the permit as soon
-    // as the call returns, so a request that is backing off no longer occupies
-    // a slot while it sleeps.
-    let provider: Arc<dyn AiProvider> = Arc::new(
-        crate::ai::concurrency_limited_provider::ConcurrencyLimitedProvider::new(
-            provider,
-            llm_semaphore.clone(),
-        ),
-    );
     // Always, in practice: the daemon is required to name one. Without the flag
     // a worker puts its worktree under the system temporary directory.
     if !settings.git.repository_path.trim().is_empty() {
@@ -3211,14 +3201,26 @@ async fn run_review_tool_with_cmd_and_overrides(
     // than an open-coded loop. A review is bounded by its activity deadline
     // rather than an attempt count, and time spent waiting out a rate limit is
     // credited back so it does not consume that budget.
-    let provider: Arc<dyn AiProvider> =
+    // Wrap concurrency and backoff decorators inside any outer response cache,
+    // so cache hits do not acquire concurrency permits or consume rate-limit quota.
+    let quota_manager = quota_manager.clone();
+    let deadline_budget = Arc::new(crate::ai::backoff_provider::DeadlineBudget::new(
+        deadline.clone(),
+    ));
+    let llm_semaphore = llm_semaphore.clone();
+    let provider: Arc<dyn AiProvider> = crate::ai::decorate_uncached(provider, move |p| {
+        let limited: Arc<dyn AiProvider> = Arc::new(
+            crate::ai::concurrency_limited_provider::ConcurrencyLimitedProvider::new(
+                p,
+                llm_semaphore,
+            ),
+        );
         Arc::new(crate::ai::backoff_provider::BackoffProvider::new(
-            provider,
-            quota_manager.clone(),
-            Some(Arc::new(crate::ai::backoff_provider::DeadlineBudget::new(
-                deadline.clone(),
-            ))),
-        ));
+            limited,
+            quota_manager,
+            Some(deadline_budget),
+        ))
+    });
 
     let mut spawned_tasks = Vec::new();
     let interaction_result =

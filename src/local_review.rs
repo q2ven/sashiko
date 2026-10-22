@@ -432,32 +432,37 @@ pub(crate) fn decorate_provider(
     quota: &Arc<crate::ai::quota::QuotaManager>,
     retry_budget: &Option<Arc<dyn crate::ai::backoff_provider::RetryBudget>>,
 ) -> std::sync::Arc<dyn crate::ai::AiProvider> {
-    let provider: std::sync::Arc<dyn crate::ai::AiProvider> = if ai.log_turns {
-        std::sync::Arc::new(crate::ai::logging_provider::LoggingProvider::new(inner))
-    } else {
-        inner
-    };
-
     if ai.provider.starts_with("stdio-") {
-        return provider;
+        if ai.log_turns {
+            return std::sync::Arc::new(crate::ai::logging_provider::LoggingProvider::new(inner));
+        }
+        return inner;
     }
 
-    let provider: std::sync::Arc<dyn crate::ai::AiProvider> = std::sync::Arc::new(
-        crate::ai::concurrency_limited_provider::ConcurrencyLimitedProvider::new(
-            provider,
-            llm_semaphore.clone(),
-        ),
-    );
+    // Wrap concurrency and backoff decorators inside any outer response cache,
+    // so cache hits do not acquire concurrency permits or consume rate-limit quota.
+    let llm_semaphore = llm_semaphore.clone();
+    let quota = quota.clone();
+    let retry_budget = retry_budget.clone();
+    let provider = crate::ai::decorate_uncached(inner, move |p| {
+        let limited: std::sync::Arc<dyn crate::ai::AiProvider> = std::sync::Arc::new(
+            crate::ai::concurrency_limited_provider::ConcurrencyLimitedProvider::new(
+                p,
+                llm_semaphore,
+            ),
+        );
+        std::sync::Arc::new(crate::ai::backoff_provider::BackoffProvider::new(
+            limited,
+            quota,
+            retry_budget,
+        ))
+    });
 
-    // Backoff goes outermost, so a call that is waiting out a rate limit holds
-    // no concurrency permit while it sleeps.
-    // With a retry budget it stops at the review's deadline, as in the daemon;
-    // without one it falls back to an attempt ceiling.
-    std::sync::Arc::new(crate::ai::backoff_provider::BackoffProvider::new(
-        provider,
-        quota.clone(),
-        retry_budget.clone(),
-    ))
+    if ai.log_turns {
+        std::sync::Arc::new(crate::ai::logging_provider::LoggingProvider::new(provider))
+    } else {
+        provider
+    }
 }
 
 /// Daemon-spawned workers (`stdio-*`) already have their retry lifecycle managed
@@ -1862,9 +1867,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_decorated_provider_passes_forget_to_the_cache() -> Result<()> {
-        // The response cache sits innermost, under every wrapper added here.
-        // forget defaults to doing nothing, so a wrapper that does not pass
-        // it on would silently let a retry replay a rejected answer again.
+        // The response cache wraps BackoffProvider and ConcurrencyLimitedProvider
+        // via decorate_uncached. Intermediate wrappers must forward forget down
+        // so a retry does not replay a rejected answer again.
         let mut settings = Settings::new()?;
         settings.ai.provider = "gemini".to_string();
         settings.ai.log_turns = true;
