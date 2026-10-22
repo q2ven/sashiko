@@ -72,8 +72,23 @@ impl AiProvider for ConcurrencyLimitedProvider {
         self.inner.generate_content(request).await
     }
 
+    fn map_cached_inner(
+        &self,
+        decorator: &mut Option<crate::ai::AiProviderDecorator>,
+    ) -> Option<Arc<dyn AiProvider>> {
+        let rewrapped = self.inner.map_cached_inner(decorator)?;
+        Some(Arc::new(Self {
+            inner: rewrapped,
+            semaphore: self.semaphore.clone(),
+        }))
+    }
+
     fn get_capabilities(&self) -> ProviderCapabilities {
         self.inner.get_capabilities()
+    }
+
+    fn cache_identity(&self) -> String {
+        self.inner.cache_identity()
     }
 
     fn cache_stats(&self) -> Option<CacheStats> {
@@ -99,5 +114,77 @@ mod tests {
         // Above that, calls are allowed to run wider than the worktrees are.
         assert_eq!(llm_permits(2), 6);
         assert_eq!(llm_permits(16), 48);
+    }
+
+    #[tokio::test]
+    async fn test_concurrency_limited_provider_delegates_map_cached_inner() {
+        use anyhow::Result;
+        use async_trait::async_trait;
+
+        struct MockCache {
+            inner: Arc<dyn AiProvider>,
+        }
+        #[async_trait]
+        impl AiProvider for MockCache {
+            fn map_cached_inner(
+                &self,
+                decorator: &mut Option<crate::ai::AiProviderDecorator>,
+            ) -> Option<Arc<dyn AiProvider>> {
+                let f = decorator.take()?;
+                Some(Arc::new(Self {
+                    inner: f(self.inner.clone()),
+                }))
+            }
+            async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+                Ok(AiResponse {
+                    content: Some("from-cache".into()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    usage: None,
+                    truncated: false,
+                })
+            }
+            fn get_capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    model_name: "mock".into(),
+                    context_window_size: 100,
+                }
+            }
+        }
+
+        struct MockNet;
+        #[async_trait]
+        impl AiProvider for MockNet {
+            async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+                panic!("network called");
+            }
+            fn get_capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    model_name: "mock".into(),
+                    context_window_size: 100,
+                }
+            }
+        }
+
+        let cache: Arc<dyn AiProvider> = Arc::new(MockCache {
+            inner: Arc::new(MockNet),
+        });
+        let sem = Arc::new(Semaphore::new(1));
+        let limited = Arc::new(ConcurrencyLimitedProvider::new(cache, sem));
+        let decorated = crate::ai::decorate_uncached(limited, |p| {
+            Arc::new(ConcurrencyLimitedProvider::new(
+                p,
+                Arc::new(Semaphore::new(0)),
+            ))
+        });
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            decorated.generate_content(AiRequest::default()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(resp.content.as_deref(), Some("from-cache"));
     }
 }

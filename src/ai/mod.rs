@@ -470,11 +470,23 @@ pub struct CacheStats {
     pub tokens_saved_prev_session: u64,
 }
 
+/// A boxed closure that wraps an [`AiProvider`] inside another decorator.
+pub type AiProviderDecorator = Box<dyn FnOnce(Arc<dyn AiProvider>) -> Arc<dyn AiProvider> + Send>;
+
 /// Trait defining the standard interface for all AI providers in Sashiko.
 #[async_trait]
 pub trait AiProvider: Send + Sync {
     /// Generates content based on the provided request.
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse>;
+
+    /// If this provider is a `CachingAiProvider`, wraps its inner provider with
+    /// `decorator` while keeping `CachingAiProvider` on the outside.
+    fn map_cached_inner(
+        &self,
+        _decorator: &mut Option<AiProviderDecorator>,
+    ) -> Option<Arc<dyn AiProvider>> {
+        None
+    }
 
     /// Returns the capabilities and constraints of this provider.
     fn get_capabilities(&self) -> ProviderCapabilities;
@@ -499,6 +511,23 @@ pub trait AiProvider: Send + Sync {
     /// response cache holds anything to drop; a provider that wraps another
     /// must pass the call on, as it does `cache_stats`.
     async fn forget(&self, _request: &AiRequest) {}
+}
+
+/// Applies a decorator to the provider, wrapping inside any outer
+/// `CachingAiProvider` so local cache hits short-circuit before reaching
+/// rate-limit or concurrency decorators.
+pub fn decorate_uncached(
+    provider: Arc<dyn AiProvider>,
+    decorator: impl FnOnce(Arc<dyn AiProvider>) -> Arc<dyn AiProvider> + Send + 'static,
+) -> Arc<dyn AiProvider> {
+    let mut opt: Option<AiProviderDecorator> = Some(Box::new(decorator));
+    if let Some(rewrapped) = provider.map_cached_inner(&mut opt) {
+        rewrapped
+    } else if let Some(f) = opt {
+        f(provider)
+    } else {
+        provider
+    }
 }
 
 /// Appends the knobs a provider applies outside the request to its model name,
