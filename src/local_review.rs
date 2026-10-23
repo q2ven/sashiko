@@ -448,13 +448,14 @@ pub(crate) fn decorate_provider(
         let limited: std::sync::Arc<dyn crate::ai::AiProvider> = std::sync::Arc::new(
             crate::ai::concurrency_limited_provider::ConcurrencyLimitedProvider::new(
                 p,
-                llm_semaphore,
-            ),
+                llm_semaphore.clone(),
+            )
+            .with_budget(retry_budget.clone()),
         );
         std::sync::Arc::new(crate::ai::backoff_provider::BackoffProvider::new(
             limited,
-            quota,
-            retry_budget,
+            quota.clone(),
+            retry_budget.clone(),
         ))
     });
 

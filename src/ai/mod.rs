@@ -488,6 +488,12 @@ pub trait AiProvider: Send + Sync {
         None
     }
 
+    /// Returns true if this provider or any inner provider manages
+    /// tracking active requests against a retry budget.
+    fn handles_active_budget(&self) -> bool {
+        false
+    }
+
     /// Returns the capabilities and constraints of this provider.
     fn get_capabilities(&self) -> ProviderCapabilities;
 

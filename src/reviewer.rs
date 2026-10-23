@@ -3200,25 +3200,27 @@ async fn run_review_tool_with_cmd_and_overrides(
     // Retry rate-limited and transient failures with the shared limiter rather
     // than an open-coded loop. A review is bounded by its activity deadline
     // rather than an attempt count, and time spent waiting out a rate limit is
-    // credited back so it does not consume that budget.
+    // credited back only when no sibling request is actively in flight.
     // Wrap concurrency and backoff decorators inside any outer response cache,
     // so cache hits do not acquire concurrency permits or consume rate-limit quota.
     let quota_manager = quota_manager.clone();
     let deadline_budget = Arc::new(crate::ai::backoff_provider::DeadlineBudget::new(
         deadline.clone(),
     ));
+    let budget_for_watchdog = deadline_budget.clone();
     let llm_semaphore = llm_semaphore.clone();
     let provider: Arc<dyn AiProvider> = crate::ai::decorate_uncached(provider, move |p| {
         let limited: Arc<dyn AiProvider> = Arc::new(
             crate::ai::concurrency_limited_provider::ConcurrencyLimitedProvider::new(
                 p,
-                llm_semaphore,
-            ),
+                llm_semaphore.clone(),
+            )
+            .with_budget(Some(deadline_budget.clone())),
         );
         Arc::new(crate::ai::backoff_provider::BackoffProvider::new(
             limited,
-            quota_manager,
-            Some(deadline_budget),
+            quota_manager.clone(),
+            Some(deadline_budget.clone()),
         ))
     });
 
@@ -3246,10 +3248,7 @@ async fn run_review_tool_with_cmd_and_overrides(
             cancel_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             loop {
-                let current_deadline = {
-                    let d = deadline.lock().unwrap();
-                    *d
-                };
+                let current_deadline = budget_for_watchdog.current_deadline();
 
                 tokio::select! {
                     biased;
@@ -3269,6 +3268,15 @@ async fn run_review_tool_with_cmd_and_overrides(
                         let line_result = match line_res {
                             Ok(res) => res,
                             Err(_) => {
+                                let new_deadline = budget_for_watchdog.current_deadline();
+                                if new_deadline > tokio::time::Instant::now() {
+                                    let remaining = new_deadline
+                                        .saturating_duration_since(tokio::time::Instant::now());
+                                    if remaining < Duration::from_millis(100) {
+                                        tokio::time::sleep(Duration::from_millis(100)).await;
+                                    }
+                                    continue;
+                                }
                                 return Err(anyhow::anyhow!(
                                     "Review tool timed out (active time exceeded)"
                                 ));
