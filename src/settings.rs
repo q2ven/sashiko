@@ -665,6 +665,15 @@ pub struct AiSettings {
     pub resume: bool,
     #[serde(default = "default_response_cache_ttl_days")]
     pub response_cache_ttl_days: u64,
+    /// Maximum outgoing AI review requests per second across the review pipeline (e.g. `1.0`, or
+    /// `0.2` for one request every 5 seconds). Unset or `0` disables RPS pacing.
+    #[serde(default)]
+    pub max_rps: Option<f64>,
+    /// Maximum tokens per minute (trailing 60-second sliding-window limit on completed uncached
+    /// input + completion tokens) across the review pipeline. Unset or `0` disables client-side
+    /// TPM throttling.
+    #[serde(default)]
+    pub max_tpm: Option<usize>,
     // Provider-specific settings
     pub claude: Option<ClaudeSettings>,
     pub gemini: Option<GeminiSettings>,
@@ -680,6 +689,19 @@ pub struct AiSettings {
     pub claude_cli: Option<ClaudeCliSettings>,
     pub codex_cli: Option<CodexCliSettings>,
     pub devin_cli: Option<DevinCliSettings>,
+}
+
+impl AiSettings {
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if let Some(r) = self.max_rps
+            && (!r.is_finite() || r < 0.0)
+        {
+            return Err(format!(
+                "invalid ai.max_rps: {r} (must be a non-negative finite number, or 0 to disable)"
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn default_response_cache_ttl_days() -> u64 {
@@ -1453,6 +1475,7 @@ impl Settings {
         if let Some(smtp) = &settings.smtp {
             smtp.validate().map_err(ConfigError::Message)?;
         }
+        settings.ai.validate().map_err(ConfigError::Message)?;
 
         Ok(settings)
     }
@@ -2378,5 +2401,30 @@ mod tests {
 
         let empty_env: ForgeSettings = serde_json::from_str(r#"{"repos": ""}"#).unwrap();
         assert!(empty_env.repos.is_empty());
+    }
+
+    #[test]
+    fn test_ai_settings_rate_limits() {
+        let minimal: AiSettings =
+            toml::from_str("provider = \"gemini\"\nmodel = \"gemini-2.5-pro\"\n").unwrap();
+        assert_eq!(minimal.max_rps, None);
+        assert_eq!(minimal.max_tpm, None);
+
+        let explicit: AiSettings = toml::from_str(
+            "provider = \"gemini\"\nmodel = \"gemini-2.5-pro\"\nmax_rps = 2.5\nmax_tpm = 50000\n",
+        )
+        .unwrap();
+        assert_eq!(explicit.max_rps, Some(2.5));
+        assert_eq!(explicit.max_tpm, Some(50000));
+    }
+
+    #[test]
+    fn test_ai_settings_rejects_negative_or_invalid_max_rps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Settings.toml");
+        let toml = "[ai]\nprovider = \"gemini\"\nmodel = \"gemini-2.5-pro\"\nmax_rps = -1.0\n[review]\nconcurrency = 1\n";
+        std::fs::write(&path, toml).unwrap();
+        let err = Settings::from_file(&path).unwrap_err();
+        assert!(err.to_string().contains("invalid ai.max_rps"));
     }
 }

@@ -508,7 +508,10 @@ async fn llm_env<'a>(
     let semaphore = Arc::new(tokio::sync::Semaphore::new(
         settings.review.concurrency.max(1),
     ));
-    let quota = Arc::new(crate::ai::quota::QuotaManager::new());
+    let quota = Arc::new(crate::ai::quota::QuotaManager::with_limits(
+        settings.ai.max_rps,
+        settings.ai.max_tpm,
+    ));
     let provider =
         crate::local_review::decorate_provider(provider, &settings.ai, &semaphore, &quota, &None);
     let mut tools = ToolBox::new(repo.to_path_buf(), Some(prompts_dir.to_path_buf()));

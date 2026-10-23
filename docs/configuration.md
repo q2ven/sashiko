@@ -151,6 +151,8 @@ Core AI settings that apply to all providers.
 | `log_turns` | bool | `false` | Log each AI request/response turn at info level. Verbose but useful for debugging. |
 | `response_cache` | bool | `false` | Cache AI responses to disk. The daemon keeps the cache beside its database; a local review, which has none, keeps it under `$XDG_DATA_HOME/sashiko/`. Entries are keyed on the provider's own settings as well as the request, so changing `model`, an endpoint, a reasoning level, or an output cap misses the entries recorded under the old value rather than replaying them. A local review records its responses whatever this is set to, and replays them only with this set or under `sashiko review --resume`. |
 | `response_cache_ttl_days` | integer | `7` | TTL for cached responses (days). Entries stranded by a settings change age out on this schedule. |
+| `max_rps` | float | -- | Maximum outgoing AI review requests per second across the review pipeline (e.g. `1.0`, or `0.2` for one request every 5 seconds). Unset or `0` disables RPS pacing. |
+| `max_tpm` | integer | -- | Maximum tokens per minute (trailing 60-second sliding-window limit on completed uncached input + completion tokens) across the review pipeline. Unset or `0` disables client-side TPM throttling. |
 
 #### `[ai.claude]`
 

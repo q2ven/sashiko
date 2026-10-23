@@ -52,6 +52,7 @@ pub struct ConcurrencyLimitedProvider {
     inner: Arc<dyn AiProvider>,
     semaphore: Arc<Semaphore>,
     budget: Option<Arc<dyn crate::ai::backoff_provider::RetryBudget>>,
+    quota: Option<Arc<crate::ai::quota::QuotaManager>>,
 }
 
 impl ConcurrencyLimitedProvider {
@@ -62,6 +63,7 @@ impl ConcurrencyLimitedProvider {
             inner,
             semaphore,
             budget: None,
+            quota: None,
         }
     }
 
@@ -70,6 +72,11 @@ impl ConcurrencyLimitedProvider {
         budget: Option<Arc<dyn crate::ai::backoff_provider::RetryBudget>>,
     ) -> Self {
         self.budget = budget;
+        self
+    }
+
+    pub fn with_quota(mut self, quota: Option<Arc<crate::ai::quota::QuotaManager>>) -> Self {
+        self.quota = quota;
         self
     }
 }
@@ -82,11 +89,41 @@ impl AiProvider for ConcurrencyLimitedProvider {
                 b.on_wait_start();
                 crate::ai::backoff_provider::QuotaWaitGuard(b.as_ref())
             });
-            self.semaphore
-                .acquire()
-                .await
-                .map_err(|e| anyhow::anyhow!("concurrency semaphore closed: {e}"))?
+
+            loop {
+                if let Some(quota) = &self.quota {
+                    quota.wait_for_cooldown().await;
+                }
+                if let Some(budget) = &self.budget {
+                    budget.check()?;
+                }
+
+                let permit = self
+                    .semaphore
+                    .acquire()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("concurrency semaphore closed: {e}"))?;
+
+                if let Some(quota) = &self.quota {
+                    let check = || {
+                        if let Some(budget) = &self.budget {
+                            budget.check()?;
+                        }
+                        Ok(())
+                    };
+                    match quota.wait_for_pacing_checked(check).await? {
+                        Some(_) => break permit,
+                        None => {
+                            drop(permit);
+                            continue;
+                        }
+                    }
+                } else {
+                    break permit;
+                }
+            }
         };
+
         if let Some(budget) = &self.budget {
             budget.check()?;
         }
@@ -101,6 +138,10 @@ impl AiProvider for ConcurrencyLimitedProvider {
         self.budget.is_some() || self.inner.handles_active_budget()
     }
 
+    fn handles_dispatch_gate(&self) -> bool {
+        self.quota.is_some() || self.inner.handles_dispatch_gate()
+    }
+
     fn map_cached_inner(
         &self,
         decorator: &mut Option<crate::ai::AiProviderDecorator>,
@@ -110,6 +151,7 @@ impl AiProvider for ConcurrencyLimitedProvider {
             inner: rewrapped,
             semaphore: self.semaphore.clone(),
             budget: self.budget.clone(),
+            quota: self.quota.clone(),
         }))
     }
 
@@ -216,5 +258,61 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(resp.content.as_deref(), Some("from-cache"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_pacing_occurs_after_semaphore_acquire() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        struct CountingMock {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl AiProvider for CountingMock {
+            async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(AiResponse {
+                    content: Some("ok".into()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    usage: None,
+                    truncated: false,
+                })
+            }
+            fn get_capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    model_name: "mock".into(),
+                    context_window_size: 1000,
+                }
+            }
+        }
+
+        let inner = Arc::new(CountingMock {
+            calls: AtomicUsize::new(0),
+        });
+        let sem = Arc::new(Semaphore::new(1));
+        // max_rps = 2.0 -> 500ms pacing interval
+        let quota = Arc::new(crate::ai::quota::QuotaManager::with_limits(Some(2.0), None));
+        let provider = ConcurrencyLimitedProvider::new(inner.clone(), sem).with_quota(Some(quota));
+
+        // First call goes through immediately
+        let resp = provider
+            .generate_content(AiRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(resp.content.as_deref(), Some("ok"));
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+
+        // Second call must pace for 500ms
+        let start = tokio::time::Instant::now();
+        let resp2 = provider
+            .generate_content(AiRequest::default())
+            .await
+            .unwrap();
+        assert_eq!(resp2.content.as_deref(), Some("ok"));
+        assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
+        assert!(tokio::time::Instant::now().duration_since(start) >= Duration::from_millis(500));
     }
 }

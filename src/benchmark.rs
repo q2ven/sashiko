@@ -583,7 +583,10 @@ pub async fn run_benchmark(
     let ai_provider: Arc<dyn AiProvider> =
         Arc::new(crate::ai::backoff_provider::BackoffProvider::new(
             ai_provider,
-            Arc::new(crate::ai::quota::QuotaManager::new()),
+            Arc::new(crate::ai::quota::QuotaManager::with_limits(
+                settings.ai.max_rps,
+                settings.ai.max_tpm,
+            )),
             None,
         ));
     let results = evaluate_benchmark_entries(

@@ -358,7 +358,11 @@ impl AiProvider for BackoffProvider {
                     b.on_wait_start();
                     QuotaWaitGuard(b.as_ref())
                 });
-                self.quota.wait_for_access().await
+                if self.inner.handles_dispatch_gate() {
+                    self.quota.wait_for_cooldown().await
+                } else {
+                    self.quota.wait_for_access().await
+                }
             };
             if let Some(budget) = &self.budget {
                 budget.credit_wait(slept);
@@ -380,6 +384,8 @@ impl AiProvider for BackoffProvider {
             match response_res {
                 Ok(response) => {
                     self.quota.report_success().await;
+                    let actual_tokens = response.usage.as_ref().map_or(0, |u| u.uncached_tokens());
+                    self.quota.record_tokens(actual_tokens);
                     return Ok(response);
                 }
                 Err(e) => {
@@ -728,6 +734,91 @@ mod tests {
 
         sem.add_permits(1);
         let _ = handle.await;
+        assert_eq!(budget.active_requests(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_backoff_provider_records_tokens_and_tracks_active_requests() {
+        struct UsageMock {
+            budget: Arc<DeadlineBudget>,
+            fail: bool,
+        }
+
+        #[async_trait]
+        impl AiProvider for UsageMock {
+            async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+                // While inside generate_content, active_requests must be 1.
+                assert_eq!(self.budget.active_requests(), 1);
+                if self.fail {
+                    return Err(GeminiError::PermissionDenied("fatal".into()).into());
+                }
+                Ok(AiResponse {
+                    content: Some("ok".into()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    usage: Some(crate::ai::AiUsage {
+                        prompt_tokens: 100,
+                        completion_tokens: 50,
+                        total_tokens: 150,
+                        cached_tokens: None,
+                    }),
+                    truncated: false,
+                })
+            }
+            fn get_capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    model_name: "mock".into(),
+                    context_window_size: 1000,
+                }
+            }
+        }
+
+        let deadline = Arc::new(std::sync::Mutex::new(
+            tokio::time::Instant::now() + Duration::from_secs(60),
+        ));
+        let budget = Arc::new(DeadlineBudget::new(deadline));
+        // Configure quota with max_tpm = 100 and a 150ms window.
+        let quota = Arc::new(QuotaManager::with_limits_and_window(
+            None,
+            Some(100),
+            Duration::from_millis(150),
+        ));
+        let provider = BackoffProvider::new(
+            Arc::new(UsageMock {
+                budget: budget.clone(),
+                fail: false,
+            }),
+            quota.clone(),
+            Some(budget.clone()),
+        );
+
+        // Before call, active_requests must be 0.
+        assert_eq!(budget.active_requests(), 0);
+        let t0 = std::time::Instant::now();
+        let resp = provider.generate_content(dummy_request()).await.unwrap();
+        assert_eq!(resp.content.as_deref(), Some("ok"));
+        // After call, active_requests must be back to 0.
+        assert_eq!(budget.active_requests(), 0);
+
+        // 150 tokens were recorded, exceeding the 100 TPM limit.
+        // The next wait_for_access() must throttle until the window passes.
+        let _ = tokio::time::timeout(Duration::from_secs(5), quota.wait_for_access())
+            .await
+            .unwrap();
+        assert!(t0.elapsed() >= Duration::from_millis(140));
+
+        // Test error case: active_requests is decremented even on failure.
+        let err_provider = BackoffProvider::new(
+            Arc::new(UsageMock {
+                budget: budget.clone(),
+                fail: true,
+            }),
+            quota.clone(),
+            Some(budget.clone()),
+        );
+        let err = err_provider.generate_content(dummy_request()).await;
+        assert!(err.is_err());
         assert_eq!(budget.active_requests(), 0);
     }
 }

@@ -450,6 +450,18 @@ impl AiUsage {
             *self.cached_tokens.get_or_insert(0) += other_cached;
         }
     }
+
+    /// Returns uncached input plus completion tokens, falling back to
+    /// `total_tokens` when neither breakdown is populated.
+    pub fn uncached_tokens(&self) -> usize {
+        let cached = self.cached_tokens.unwrap_or(0);
+        let from_parts = self
+            .prompt_tokens
+            .saturating_sub(cached)
+            .saturating_add(self.completion_tokens);
+        let from_total = self.total_tokens.saturating_sub(cached);
+        from_parts.max(from_total)
+    }
 }
 
 /// Information about the capabilities and constraints of an AI provider.
@@ -491,6 +503,12 @@ pub trait AiProvider: Send + Sync {
     /// Returns true if this provider or any inner provider manages
     /// tracking active requests against a retry budget.
     fn handles_active_budget(&self) -> bool {
+        false
+    }
+
+    /// Returns true if this provider or any inner provider manages
+    /// pacing through a dispatch gate.
+    fn handles_dispatch_gate(&self) -> bool {
         false
     }
 
@@ -1218,6 +1236,33 @@ mod tests {
     use crate::worker::prompts::ReviewError;
     use anyhow::anyhow;
     use serde_json::json;
+
+    #[test]
+    fn test_ai_usage_uncached_tokens() {
+        let usage = AiUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            cached_tokens: Some(40),
+        };
+        assert_eq!(usage.uncached_tokens(), 110);
+
+        let uncached = AiUsage {
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            cached_tokens: None,
+        };
+        assert_eq!(uncached.uncached_tokens(), 150);
+
+        let fallback_only = AiUsage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 42,
+            cached_tokens: None,
+        };
+        assert_eq!(fallback_only.uncached_tokens(), 42);
+    }
 
     #[tokio::test]
     async fn test_a_run_that_caches_through_the_daemon_does_not_cache_again() {

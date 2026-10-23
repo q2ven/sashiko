@@ -450,7 +450,8 @@ pub(crate) fn decorate_provider(
                 p,
                 llm_semaphore.clone(),
             )
-            .with_budget(retry_budget.clone()),
+            .with_budget(retry_budget.clone())
+            .with_quota(Some(quota.clone())),
         );
         std::sync::Arc::new(crate::ai::backoff_provider::BackoffProvider::new(
             limited,
@@ -1063,7 +1064,10 @@ async fn run_worker_in_worktree(
         crate::ai::concurrency_limited_provider::llm_permits(concurrency),
     ));
     // Shared so a rate-limit response from one request backs the whole run off.
-    let quota = Arc::new(crate::ai::quota::QuotaManager::new());
+    let quota = Arc::new(crate::ai::quota::QuotaManager::with_limits(
+        settings.ai.max_rps,
+        settings.ai.max_tpm,
+    ));
     // Execute patch reviews concurrently with a limit
     let futures_stream = futures::stream::iter(patches_to_review.iter().map(|p| {
         let rich_patches = rich_patches.clone();

@@ -157,6 +157,10 @@ impl Reviewer {
             .expect("Failed to create AI provider");
 
         let llm_concurrency = crate::ai::concurrency_limited_provider::llm_permits(concurrency);
+        let quota_manager = Arc::new(QuotaManager::with_limits(
+            settings.ai.max_rps,
+            settings.ai.max_tpm,
+        ));
 
         Self {
             db,
@@ -164,7 +168,7 @@ impl Reviewer {
             semaphore: Arc::new(Semaphore::new(concurrency)),
             llm_semaphore: Arc::new(Semaphore::new(llm_concurrency)),
             baseline_registry,
-            quota_manager: Arc::new(QuotaManager::new()),
+            quota_manager,
             provider,
             worker_overrides: WorkerSubprocessOverrides::default(),
             initialized: std::sync::atomic::AtomicBool::new(false),
@@ -3215,7 +3219,8 @@ async fn run_review_tool_with_cmd_and_overrides(
                 p,
                 llm_semaphore.clone(),
             )
-            .with_budget(Some(deadline_budget.clone())),
+            .with_budget(Some(deadline_budget.clone()))
+            .with_quota(Some(quota_manager.clone())),
         );
         Arc::new(crate::ai::backoff_provider::BackoffProvider::new(
             limited,
