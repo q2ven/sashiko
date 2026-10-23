@@ -41,8 +41,8 @@ use tracing::warn;
 
 use crate::ai::quota::QuotaManager;
 use crate::ai::{
-    AiErrorClass, AiProvider, AiRequest, AiResponse, CacheStats, ProviderCapabilities,
-    classify_ai_error, get_log_prefix,
+    AiErrorClass, AiProvider, AiProviderDecorator, AiRequest, AiResponse, CacheStats,
+    ProviderCapabilities, classify_ai_error, get_log_prefix,
 };
 
 /// Maximum number of attempts (initial try plus retries) for a single call
@@ -55,65 +55,260 @@ const MAX_ATTEMPTS: u32 = 6;
 /// and stop the retry loop early.
 ///
 /// The daemon bounds a review by an activity deadline rather than by an attempt
-/// count, and does not want a rate-limit wait to consume that budget, so it
-/// credits the wait back and fails once the deadline passes.
+/// count, and credits rate-limit pacing waits back only when no sibling request
+/// is actively in flight, failing once the deadline passes.
 pub trait RetryBudget: Send + Sync {
     /// Time spent blocked on the shared quota gate before an attempt.
     fn credit_wait(&self, slept: Duration);
     /// Return an error to abandon further retries.
     fn check(&self) -> Result<()>;
+    /// Called when an underlying provider request starts.
+    fn on_request_start(&self) {}
+    /// Called when an underlying provider request finishes.
+    fn on_request_end(&self) {}
+    /// Called when waiting on a quota gate or semaphore starts.
+    fn on_wait_start(&self) {}
+    /// Called when waiting on a quota gate or semaphore ends.
+    fn on_wait_end(&self) {}
+    /// Returns the current deadline, flushing any pending idle wait.
+    fn current_deadline(&self) -> Option<tokio::time::Instant> {
+        None
+    }
+}
+
+#[derive(Default)]
+struct ActiveTracker {
+    active_count: usize,
+    waiting_count: usize,
+    idle_wait_since: Option<tokio::time::Instant>,
+    last_credit_end: Option<tokio::time::Instant>,
+    last_active_end: Option<tokio::time::Instant>,
+}
+
+impl ActiveTracker {
+    fn flush_idle_wait_at(
+        &mut self,
+        now: tokio::time::Instant,
+        deadline: &mut tokio::time::Instant,
+    ) {
+        if self.active_count == 0
+            && let Some(since) = self.idle_wait_since
+            && now > since
+        {
+            let uncredited = now - since;
+            if uncredited >= Duration::from_millis(1) {
+                *deadline += uncredited;
+                self.last_credit_end = Some(now);
+                self.idle_wait_since = Some(now);
+            }
+        }
+    }
+
+    fn on_wait_start_at(&mut self, now: tokio::time::Instant, deadline: &mut tokio::time::Instant) {
+        self.flush_idle_wait_at(now, deadline);
+        if self.waiting_count == 0 && self.active_count == 0 {
+            let since = self.last_credit_end.map_or(now, |end| now.max(end));
+            self.idle_wait_since = Some(since);
+        }
+        self.waiting_count += 1;
+    }
+
+    fn on_wait_end_at(&mut self, now: tokio::time::Instant, deadline: &mut tokio::time::Instant) {
+        self.flush_idle_wait_at(now, deadline);
+        self.waiting_count = self.waiting_count.saturating_sub(1);
+        if self.waiting_count == 0 {
+            self.idle_wait_since = None;
+        }
+    }
+
+    fn on_request_start_at(
+        &mut self,
+        now: tokio::time::Instant,
+        deadline: &mut tokio::time::Instant,
+    ) {
+        self.flush_idle_wait_at(now, deadline);
+        self.idle_wait_since = None;
+        self.active_count += 1;
+    }
+
+    fn on_request_end_at(
+        &mut self,
+        now: tokio::time::Instant,
+        _deadline: &mut tokio::time::Instant,
+    ) {
+        self.last_active_end = Some(now);
+        self.active_count = self.active_count.saturating_sub(1);
+        if self.active_count == 0 && self.waiting_count > 0 {
+            let since = self.last_credit_end.map_or(now, |end| now.max(end));
+            self.idle_wait_since = Some(since);
+        }
+    }
+
+    fn credit_wait_at(
+        &mut self,
+        now: tokio::time::Instant,
+        slept: Duration,
+        deadline: &mut tokio::time::Instant,
+    ) {
+        self.flush_idle_wait_at(now, deadline);
+        if slept.is_zero() || self.active_count > 0 {
+            return;
+        }
+        let sleep_start = now.checked_sub(slept).unwrap_or(now);
+        let mut effective_start = match self.last_credit_end {
+            Some(end) if end > sleep_start => end,
+            _ => sleep_start,
+        };
+        if let Some(active_end) = self.last_active_end
+            && active_end > effective_start
+        {
+            effective_start = active_end;
+        }
+        if now > effective_start {
+            let uncredited = now - effective_start;
+            if uncredited >= Duration::from_millis(1) {
+                *deadline += uncredited;
+                self.last_credit_end = Some(now);
+            }
+        }
+    }
 }
 
 /// A [`RetryBudget`] backed by a wall-clock deadline shared with the caller.
 ///
-/// Time spent parked on the quota gate is credited back, so waiting out a rate
-/// limit does not consume the caller's budget.
+/// Time spent parked on the quota gate is credited back only when no sibling
+/// request of the review is actively in flight, so waiting out a rate limit while
+/// completely idle does not consume the caller's budget.
 pub struct DeadlineBudget {
     deadline: Arc<std::sync::Mutex<tokio::time::Instant>>,
-    last_credit_end: std::sync::Mutex<Option<tokio::time::Instant>>,
+    tracker: std::sync::Mutex<ActiveTracker>,
 }
 
 impl DeadlineBudget {
     pub fn new(deadline: Arc<std::sync::Mutex<tokio::time::Instant>>) -> Self {
         Self {
             deadline,
-            last_credit_end: std::sync::Mutex::new(None),
+            tracker: std::sync::Mutex::new(ActiveTracker::default()),
         }
+    }
+
+    pub fn current_deadline_at(&self, now: tokio::time::Instant) -> tokio::time::Instant {
+        let mut deadline = self.deadline.lock().unwrap();
+        let mut tracker = self.tracker.lock().unwrap();
+        tracker.flush_idle_wait_at(now, &mut deadline);
+        *deadline
+    }
+
+    pub fn current_deadline(&self) -> tokio::time::Instant {
+        self.current_deadline_at(tokio::time::Instant::now())
+    }
+
+    pub fn active_requests(&self) -> usize {
+        self.tracker.lock().unwrap().active_count
+    }
+
+    #[cfg(test)]
+    pub fn on_wait_start_at(&self, now: tokio::time::Instant) {
+        let mut d = self.deadline.lock().unwrap();
+        self.tracker.lock().unwrap().on_wait_start_at(now, &mut d);
+    }
+
+    #[cfg(test)]
+    pub fn on_wait_end_at(&self, now: tokio::time::Instant) {
+        let mut d = self.deadline.lock().unwrap();
+        self.tracker.lock().unwrap().on_wait_end_at(now, &mut d);
+    }
+
+    #[cfg(test)]
+    pub fn on_request_start_at(&self, now: tokio::time::Instant) {
+        let mut d = self.deadline.lock().unwrap();
+        self.tracker
+            .lock()
+            .unwrap()
+            .on_request_start_at(now, &mut d);
+    }
+
+    #[cfg(test)]
+    pub fn on_request_end_at(&self, now: tokio::time::Instant) {
+        let mut d = self.deadline.lock().unwrap();
+        self.tracker.lock().unwrap().on_request_end_at(now, &mut d);
+    }
+
+    #[cfg(test)]
+    pub fn credit_wait_at(&self, now: tokio::time::Instant, slept: Duration) {
+        let mut d = self.deadline.lock().unwrap();
+        self.tracker
+            .lock()
+            .unwrap()
+            .credit_wait_at(now, slept, &mut d);
     }
 }
 
 impl RetryBudget for DeadlineBudget {
-    fn credit_wait(&self, slept: Duration) {
-        if slept.is_zero() {
-            return;
-        }
+    fn on_wait_start(&self) {
         let now = tokio::time::Instant::now();
-        let sleep_start = now.checked_sub(slept).unwrap_or(now);
-        let mut last_end = self.last_credit_end.lock().unwrap();
-        let effective_start = match *last_end {
-            Some(end) if end > sleep_start => end,
-            _ => sleep_start,
-        };
-        if now > effective_start {
-            let uncredited = now - effective_start;
-            // Filter out sub-millisecond thread scheduling jitter between
-            // concurrent tasks waking from the same rate-limit window.
-            if uncredited >= Duration::from_millis(1) {
-                let mut d = self.deadline.lock().unwrap();
-                *d += uncredited;
-                *last_end = Some(now);
-            }
-        }
+        let mut d = self.deadline.lock().unwrap();
+        self.tracker.lock().unwrap().on_wait_start_at(now, &mut d);
+    }
+
+    fn on_wait_end(&self) {
+        let now = tokio::time::Instant::now();
+        let mut d = self.deadline.lock().unwrap();
+        self.tracker.lock().unwrap().on_wait_end_at(now, &mut d);
+    }
+
+    fn on_request_start(&self) {
+        let now = tokio::time::Instant::now();
+        let mut d = self.deadline.lock().unwrap();
+        self.tracker
+            .lock()
+            .unwrap()
+            .on_request_start_at(now, &mut d);
+    }
+
+    fn on_request_end(&self) {
+        let now = tokio::time::Instant::now();
+        let mut d = self.deadline.lock().unwrap();
+        self.tracker.lock().unwrap().on_request_end_at(now, &mut d);
+    }
+
+    fn credit_wait(&self, slept: Duration) {
+        let now = tokio::time::Instant::now();
+        let mut d = self.deadline.lock().unwrap();
+        self.tracker
+            .lock()
+            .unwrap()
+            .credit_wait_at(now, slept, &mut d);
     }
 
     fn check(&self) -> Result<()> {
-        let current = { *self.deadline.lock().unwrap() };
+        let current = self.current_deadline();
         if tokio::time::Instant::now() > current {
             return Err(anyhow::anyhow!(
                 "Review tool timed out (active time exceeded)"
             ));
         }
         Ok(())
+    }
+
+    fn current_deadline(&self) -> Option<tokio::time::Instant> {
+        Some(self.current_deadline())
+    }
+}
+
+pub(crate) struct QuotaWaitGuard<'a>(pub(crate) &'a dyn RetryBudget);
+
+impl<'a> Drop for QuotaWaitGuard<'a> {
+    fn drop(&mut self) {
+        self.0.on_wait_end();
+    }
+}
+
+pub(crate) struct RequestActiveGuard<'a>(pub(crate) &'a dyn RetryBudget);
+
+impl<'a> Drop for RequestActiveGuard<'a> {
+    fn drop(&mut self) {
+        self.0.on_request_end();
     }
 }
 
@@ -158,13 +353,31 @@ impl AiProvider for BackoffProvider {
         loop {
             // Honour any active global rate-limit window before trying. The
             // wait is reported so a caller can keep it off its own deadline.
-            let slept = self.quota.wait_for_access().await;
+            let slept = {
+                let _wait_guard = self.budget.as_ref().map(|b| {
+                    b.on_wait_start();
+                    QuotaWaitGuard(b.as_ref())
+                });
+                self.quota.wait_for_access().await
+            };
             if let Some(budget) = &self.budget {
                 budget.credit_wait(slept);
                 budget.check()?;
             }
 
-            match self.inner.generate_content(request.clone()).await {
+            let response_res = {
+                let _active_guard = (!self.inner.handles_active_budget())
+                    .then(|| {
+                        self.budget.as_ref().map(|b| {
+                            b.on_request_start();
+                            RequestActiveGuard(b.as_ref())
+                        })
+                    })
+                    .flatten();
+                self.inner.generate_content(request.clone()).await
+            };
+
+            match response_res {
                 Ok(response) => {
                     self.quota.report_success().await;
                     return Ok(response);
@@ -210,6 +423,20 @@ impl AiProvider for BackoffProvider {
                 }
             }
         }
+    }
+
+    fn map_cached_inner(
+        &self,
+        decorator: &mut Option<AiProviderDecorator>,
+    ) -> Option<Arc<dyn AiProvider>> {
+        let rewrapped = self.inner.map_cached_inner(decorator)?;
+        Some(Arc::new(Self {
+            inner: rewrapped,
+            quota: self.quota.clone(),
+            base_delay: self.base_delay,
+            max_attempts: self.max_attempts,
+            budget: self.budget.clone(),
+        }))
     }
 
     fn get_capabilities(&self) -> ProviderCapabilities {
@@ -404,5 +631,103 @@ mod tests {
         budget.credit_wait(Duration::ZERO);
         let d3 = *deadline.lock().unwrap();
         assert_eq!(d2, d3);
+    }
+
+    #[test]
+    fn test_credit_wait_does_not_extend_deadline_during_active_requests() {
+        let deadline = Arc::new(std::sync::Mutex::new(
+            tokio::time::Instant::now() + Duration::from_secs(10),
+        ));
+        let budget = DeadlineBudget::new(deadline.clone());
+
+        // When a sibling request is active
+        budget.on_request_start();
+        let initial_deadline = *deadline.lock().unwrap();
+
+        // Calling credit_wait while active_requests > 0 must NOT extend the deadline
+        budget.credit_wait(Duration::from_secs(5));
+        assert_eq!(*deadline.lock().unwrap(), initial_deadline);
+
+        budget.on_request_end();
+    }
+
+    #[test]
+    fn test_credit_wait_clamps_to_last_active_end() {
+        let base = tokio::time::Instant::now();
+        let deadline = Arc::new(std::sync::Mutex::new(base + Duration::from_secs(10)));
+        let budget = DeadlineBudget::new(deadline.clone());
+
+        budget.on_request_start();
+        budget.on_request_end_at(base + Duration::from_millis(500));
+
+        let initial_deadline = *deadline.lock().unwrap();
+        // Calling credit_wait_at with a sleep duration that predates active_end
+        // gives no credit because effective_start is clamped to active_end.
+        budget.credit_wait_at(
+            base + Duration::from_millis(500),
+            Duration::from_millis(500),
+        );
+        assert_eq!(*deadline.lock().unwrap(), initial_deadline);
+
+        // Calling credit_wait_at at base + 600ms for a sleep of 500ms credits only the 100ms
+        // elapsed after active_end.
+        budget.credit_wait_at(
+            base + Duration::from_millis(600),
+            Duration::from_millis(500),
+        );
+        let advanced = *deadline.lock().unwrap();
+        assert_eq!(advanced, initial_deadline + Duration::from_millis(100));
+    }
+
+    #[test]
+    fn test_staggered_waiters_credit_full_idle_interval() {
+        let base = tokio::time::Instant::now();
+        let deadline = Arc::new(std::sync::Mutex::new(base + Duration::from_secs(10)));
+        let budget = DeadlineBudget::new(deadline.clone());
+
+        // Waiter 1 starts waiting at t1 = base
+        budget.on_wait_start_at(base);
+        // Waiter 2 starts waiting at t2 = base + 200ms
+        budget.on_wait_start_at(base + Duration::from_millis(200));
+
+        // Waiter 2 wakes at t3 = base + 500ms and starts request
+        budget.on_wait_end_at(base + Duration::from_millis(500));
+        budget.on_request_start_at(base + Duration::from_millis(500));
+
+        // Waiter 1 wakes at t3 = base + 500ms and ends wait
+        budget.on_wait_end_at(base + Duration::from_millis(500));
+
+        // The entire [base, base + 500ms] idle window should be credited (500ms)
+        let advanced = *deadline.lock().unwrap();
+        assert_eq!(
+            advanced,
+            base + Duration::from_secs(10) + Duration::from_millis(500)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrency_limited_waiter_does_not_increment_active_until_permit() {
+        use crate::ai::concurrency_limited_provider::ConcurrencyLimitedProvider;
+        use tokio::sync::Semaphore;
+
+        let base = tokio::time::Instant::now();
+        let deadline = Arc::new(std::sync::Mutex::new(base + Duration::from_secs(10)));
+        let budget = Arc::new(DeadlineBudget::new(deadline.clone()));
+        let sem = Arc::new(Semaphore::new(0));
+
+        let m = mock(Behaviour::Fatal, 0, Duration::ZERO);
+        let limited = Arc::new(
+            ConcurrencyLimitedProvider::new(m, sem.clone()).with_budget(Some(budget.clone())),
+        );
+
+        let lim = limited.clone();
+        let handle = tokio::spawn(async move { lim.generate_content(dummy_request()).await });
+
+        tokio::task::yield_now().await;
+        assert_eq!(budget.active_requests(), 0);
+
+        sem.add_permits(1);
+        let _ = handle.await;
+        assert_eq!(budget.active_requests(), 0);
     }
 }

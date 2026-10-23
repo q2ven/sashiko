@@ -51,25 +51,54 @@ pub fn llm_permits(concurrency: usize) -> usize {
 pub struct ConcurrencyLimitedProvider {
     inner: Arc<dyn AiProvider>,
     semaphore: Arc<Semaphore>,
+    budget: Option<Arc<dyn crate::ai::backoff_provider::RetryBudget>>,
 }
 
 impl ConcurrencyLimitedProvider {
     /// The semaphore is shared, so every provider built from it draws on the
     /// same pool of permits.
     pub fn new(inner: Arc<dyn AiProvider>, semaphore: Arc<Semaphore>) -> Self {
-        Self { inner, semaphore }
+        Self {
+            inner,
+            semaphore,
+            budget: None,
+        }
+    }
+
+    pub fn with_budget(
+        mut self,
+        budget: Option<Arc<dyn crate::ai::backoff_provider::RetryBudget>>,
+    ) -> Self {
+        self.budget = budget;
+        self
     }
 }
 
 #[async_trait]
 impl AiProvider for ConcurrencyLimitedProvider {
     async fn generate_content(&self, request: AiRequest) -> Result<AiResponse> {
-        let _permit = self
-            .semaphore
-            .acquire()
-            .await
-            .map_err(|e| anyhow::anyhow!("concurrency semaphore closed: {e}"))?;
+        let _permit = {
+            let _wait_guard = self.budget.as_ref().map(|b| {
+                b.on_wait_start();
+                crate::ai::backoff_provider::QuotaWaitGuard(b.as_ref())
+            });
+            self.semaphore
+                .acquire()
+                .await
+                .map_err(|e| anyhow::anyhow!("concurrency semaphore closed: {e}"))?
+        };
+        if let Some(budget) = &self.budget {
+            budget.check()?;
+        }
+        let _active_guard = self.budget.as_ref().map(|b| {
+            b.on_request_start();
+            crate::ai::backoff_provider::RequestActiveGuard(b.as_ref())
+        });
         self.inner.generate_content(request).await
+    }
+
+    fn handles_active_budget(&self) -> bool {
+        self.budget.is_some() || self.inner.handles_active_budget()
     }
 
     fn map_cached_inner(
@@ -80,6 +109,7 @@ impl AiProvider for ConcurrencyLimitedProvider {
         Some(Arc::new(Self {
             inner: rewrapped,
             semaphore: self.semaphore.clone(),
+            budget: self.budget.clone(),
         }))
     }
 

@@ -395,11 +395,11 @@ distinction is the point of the file:
   carries no `Retry-After`, so without it concurrent callers re-collide.
 - `Fatal` → returned immediately, no sleep.
 
-`DeadlineBudget` credits quota wait time back to the caller's deadline so
-a rate-limit window does not eat a review's activity budget. Its
-`last_credit_end` de-duplication matters because several concurrent tasks
-wake from the *same* window and each reports the full sleep;
-`deadline_budget_credit_wait_deduplicates_overlapping_sleeps` pins it.
+`DeadlineBudget` credits quota wait time back to the caller's deadline only
+when no sibling requests of the review are in flight, so a rate-limit window
+while completely idle does not eat a review's activity budget. Its
+`last_credit_end` and `last_active_end` tracking de-duplicates overlapping
+sleeps and clamps credit to intervals after previous active requests finished.
 With a budget, `max_attempts` is `None` and the loop runs until the
 deadline; without one it falls back to `MAX_ATTEMPTS = 6`.
 
